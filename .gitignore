@@ -1,0 +1,4 @@
+# Reports and copied reports describe real PCs, users and print servers.
+*.txt
+*.json
+*.html
