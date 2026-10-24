@@ -8,10 +8,10 @@ From [ihavenoram.com](https://ihavenoram.com): field notes for ADHD techs runnin
 
 ## Download
 
-Grab the latest zip from **[Releases](../../releases/latest)**. The SHA-256 checksum is in the release notes and in the `.sha256` file beside the zip:
+Grab **`printers.zip`** from **[Releases](../../releases/latest)**. It holds one folder, `printers\`, with only what runs: the scripts and a `.cmd` launcher for each. Copy that folder to the PC or server (for example `C:\temp\printers`); this README and the docs stay here on GitHub. The SHA-256 checksum is in the release notes and in the `.sha256` file beside the zip:
 
 ```powershell
-Get-FileHash .\Printer-Manager.zip -Algorithm SHA256
+Get-FileHash .\printers.zip -Algorithm SHA256
 ```
 
 ## Run it

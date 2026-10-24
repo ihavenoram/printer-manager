@@ -1,4 +1,6 @@
-﻿<#
+﻿# Printer Manager 2.2.1 - https://ihavenoram.com - https://github.com/ihavenoram/printer-manager
+# MIT licence, (c) 2026 ihavenoram.com. If you publish something built on this, please credit ihavenoram.com.
+<#
 =========================================================
 Script Name: PrinterManager-Gui
 Description: SYSTEM-capable WinForms printer console. Built to run in ScreenConnect
