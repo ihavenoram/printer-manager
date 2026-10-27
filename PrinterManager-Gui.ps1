@@ -1,4 +1,4 @@
-﻿# Printer Manager 2.2.1 - https://ihavenoram.com - https://github.com/ihavenoram/printer-manager
+﻿# Printer Manager 2.3.0 - https://ihavenoram.com - https://github.com/ihavenoram/printer-manager
 # MIT licence, (c) 2026 ihavenoram.com. If you publish something built on this, please credit ihavenoram.com.
 <#
 =========================================================
@@ -128,10 +128,10 @@ if (-not $NoHideConsole) {
 }
 
 
-#region TOOLKIT --- INLINED by Build-PrinterToolkit.ps1 from PrinterToolkit.psm1 v2.2.0 on 2026-10-09 14:31.
+#region TOOLKIT --- INLINED by Build-PrinterToolkit.ps1 from PrinterToolkit.psm1 v2.3.0 on 2026-10-27 13:41.
 # The printer toolkit module, inlined so this one file is all you need.
 $script:ToolkitSource = @'
-$script:ToolkitVersion = '2.2.0'
+$script:ToolkitVersion = '2.3.0'
 
 # Count of bounded calls that timed out and had to be abandoned (see
 # Invoke-WithTimeout). Non-zero means some print data could not be read because a
@@ -2562,7 +2562,7 @@ function Rename-PrinterSafe {
     } catch {
         $first = $_.Exception.Message
         try {
-            $esc = $Name -replace "'", "''"
+            $esc = ($Name -replace '\\', '\\') -replace "'", "\'"
             $p = Get-CimInstance Win32_Printer -Filter "Name='$esc'" -ErrorAction Stop
             $r = Invoke-CimMethod -InputObject $p -MethodName RenamePrinter -Arguments @{ NewPrinterName = $NewName } -ErrorAction Stop
             if ([int]$r.ReturnValue -eq 0) { return [pscustomobject]@{ Success=$true; Message="Renamed '$Name' to '$NewName' (WMI)." } }
@@ -2857,7 +2857,7 @@ function Set-DefaultPrinterForUser {
         catch {
             $err = $_.Exception.Message
             try {
-                $esc = $Target -replace "'", "''"
+                $esc = ($Target -replace '\\', '\\') -replace "'", "\'"
                 $p = Get-CimInstance Win32_Printer -Filter "Name='$esc'" -ErrorAction Stop
                 $res = Invoke-CimMethod -InputObject $p -MethodName SetDefaultPrinter -ErrorAction Stop
                 if ([int]$res.ReturnValue -eq 0) { $ok = $true; $err = '' } else { $err = "$err / CIM returned $($res.ReturnValue)" }
@@ -2928,7 +2928,7 @@ function Invoke-PrinterTestPage {
     $r = Invoke-ScriptInPrinterUserSession -User $User -OnPoll $OnPoll -Vars @{ Target = $PrinterName } -ScriptBlock {
         $ok = $false; $err = ''
         try {
-            $esc = $Target -replace "'", "''"
+            $esc = ($Target -replace '\\', '\\') -replace "'", "\'"
             $p = Get-CimInstance Win32_Printer -Filter "Name='$esc'" -ErrorAction Stop
             $res = Invoke-CimMethod -InputObject $p -MethodName PrintTestPage -ErrorAction Stop
             if ([int]$res.ReturnValue -eq 0) { $ok = $true } else { $err = "PrintTestPage returned $($res.ReturnValue)" }
@@ -2951,7 +2951,7 @@ function Clear-PrinterQueue {
         return [pscustomobject]@{ Success=$false; Message='Skipped (WhatIf).' }
     }
     try {
-        $esc = $PrinterName -replace "'", "''"
+        $esc = ($PrinterName -replace '\\', '\\') -replace "'", "\'"
         $p = Get-CimInstance Win32_Printer -Filter "Name='$esc'" -ErrorAction Stop
         $r = Invoke-CimMethod -InputObject $p -MethodName CancelAllJobs -ErrorAction Stop
         if ([int]$r.ReturnValue -eq 0) { return [pscustomobject]@{ Success=$true; Message="Cancelled all jobs on '$PrinterName'." } }
@@ -3633,44 +3633,93 @@ function Install-PrinterDriverFromInf {
         copied out on its own: printer INFs carry CopyINF dependencies on sibling
         files and staging fails without them.
 
+        Before staging, the package's catalog signature is read. A package signed by
+        its VENDOR rather than by Microsoft (Canon's Generic Plus drivers, for one)
+        installs silently only once that publisher is trusted on the PC - at the
+        desktop Windows asks "Always trust software from Canon Inc.?", which pnputil
+        and a SYSTEM session cannot show, so pnputil fails with 0xE0000242. That case
+        returns NeedsTrust with the signer, and nothing is run; -TrustPublisher adds
+        exactly that signer's certificate first (Add-DriverPublisherTrust).
+
+        After pnputil, staging is CONFIRMED by finding the INF in the driver store,
+        not assumed from the exit code: a failed stage used to be reported as
+        "continuing; the package may already be staged", and Add-PrinterDriver's
+        follow-up error then blamed the driver name.
+
         -RestartSpooler first when a package has failed once: vendors register
         language-monitor DLLs that spoolsv.exe holds open, which aborts the install
         part-way through.
     .OUTPUTS
-        PSCustomObject { Success; Message; DriverName }
+        PSCustomObject { Success; Message; DriverName; NeedsTrust; Trust }
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$InfPath,
         [Parameter(Mandatory)][string]$DriverName,
         [switch]$RestartSpooler,
+        [switch]$TrustPublisher,
         [switch]$Preview
     )
+    $ret = {
+        param([bool]$Ok, [string]$Msg, [bool]$Needs = $false, $TrustInfo = $null)
+        [pscustomobject]@{ Success = $Ok; DriverName = $DriverName; Message = $Msg; NeedsTrust = $Needs; Trust = $TrustInfo }
+    }
 
     if (Get-PrinterDriver -Name $DriverName -ErrorAction SilentlyContinue) {
-        return [pscustomobject]@{ Success=$true; DriverName=$DriverName; Message="Driver '$DriverName' is already registered with the spooler." }
+        return (& $ret $true "Driver '$DriverName' is already registered with the spooler.")
     }
     if (-not (Test-Path -LiteralPath $InfPath)) {
-        return [pscustomobject]@{ Success=$false; DriverName=$DriverName; Message="INF not found: $InfPath" }
+        return (& $ret $false "INF not found: $InfPath")
     }
     if ($Preview) {
-        return [pscustomobject]@{ Success=$true; DriverName=$DriverName; Message="Would stage '$InfPath' with pnputil and register driver '$DriverName'." }
+        return (& $ret $true "Would stage '$InfPath' with pnputil and register driver '$DriverName'.")
+    }
+    if (-not (Test-PrintToolkitElevated)) {
+        return (& $ret $false 'Installing a printer driver needs elevation. Run this console as Administrator, or as SYSTEM from Backstage.')
     }
 
     $log = [System.Collections.Generic.List[string]]::new()
-    if ($RestartSpooler) { $log.Add((Restart-PrintSpooler).Message) }
 
-    try {
-        $null = & pnputil.exe /add-driver "$InfPath" /install 2>&1
-        $code = $LASTEXITCODE
-        # 3010 = success, reboot required. Other non-zero codes are often benign
-        # (already staged), so continue and let registration be the judge.
-        if ($code -eq 0 -or $code -eq 3010) { $log.Add("pnputil staged the package (exit $code).") }
-        else { $log.Add("pnputil exit $code - continuing; the package may already be staged.") }
-    } catch {
-        $log.Add("pnputil failed: $($_.Exception.Message)")
+    # ---- the signature, before anything is run ----
+    $trust = Get-DriverPackageTrust -InfPath $InfPath
+    if (@('NotSigned', 'HashMismatch', 'NotTrusted', 'UnknownError', 'CatalogMissing') -contains $trust.Status) {
+        return (& $ret $false ("Nothing was installed. " + $trust.Message) $false $trust)
+    }
+    if ($trust.NeedsTrust) {
+        if (-not $TrustPublisher) {
+            return (& $ret $false ("Nothing was installed. " + $trust.Message) $true $trust)
+        }
+        $added = Add-DriverPublisherTrust -InfPath $InfPath
+        if (-not $added.Success) { return (& $ret $false ("Nothing was installed. " + $added.Message) $true $trust) }
+        $log.Add($added.Message)
     }
 
+    if ($RestartSpooler) { $log.Add((Restart-PrintSpooler).Message) }
+
+    # ---- stage, then CONFIRM it is in the driver store ----
+    $leaf = Split-Path -Leaf $InfPath
+    $inStore = {
+        $enum = ''
+        try { $enum = (& pnputil.exe /enum-drivers 2>&1 | Out-String) } catch {}
+        # The value line is the INF's own file name, so this does not depend on the
+        # language pnputil prints its labels in.
+        return [bool]($enum -match ('(?im)^[^\r\n:]+:\s*' + [regex]::Escape($leaf) + '\s*$'))
+    }
+    $code = $null; $pnpOut = ''
+    try {
+        $pnpOut = (& pnputil.exe /add-driver "$InfPath" /install 2>&1 | Out-String)
+        $code = $LASTEXITCODE
+    } catch {
+        $log.Add("pnputil could not be run: $($_.Exception.Message)")
+    }
+    $staged = & $inStore
+    if (-not $staged) {
+        $why = if ($null -ne $code) { "pnputil exit $code - $(Get-PnputilExitText -Code $code)." } else { 'pnputil did not run.' }
+        return (& $ret $false ("'$leaf' is not in the driver store, so nothing was installed. $why " + ($log -join ' ')).Trim() ([bool]$trust.NeedsTrust) $trust)
+    }
+    $log.Add($(if ($code -eq 0 -or $code -eq 3010) { "pnputil staged the package (exit $code)." } else { "The package is in the driver store (pnputil exit $code - $(Get-PnputilExitText -Code $code))." }))
+
+    # ---- register with the spooler ----
     if (-not (Get-PrinterDriver -Name $DriverName -ErrorAction SilentlyContinue)) {
         try {
             Add-PrinterDriver -Name $DriverName -ErrorAction Stop
@@ -3679,17 +3728,272 @@ function Install-PrinterDriverFromInf {
                 Add-PrinterDriver -Name $DriverName -InfPath $InfPath -ErrorAction Stop
             } catch {
                 $log.Add("Add-PrinterDriver failed: $($_.Exception.Message)")
-                return [pscustomobject]@{
-                    Success=$false; DriverName=$DriverName
-                    Message=("Driver '$DriverName' could not be registered. " + ($log -join ' ') + " Check the name matches one the INF actually declares.")
-                }
+                # Staging is confirmed above, so a refusal here really is about the name.
+                return (& $ret $false ("The package is staged, but driver '$DriverName' could not be registered. " + ($log -join ' ') + " Check the name matches one the INF actually declares."))
             }
         }
     }
     if (-not (Get-PrinterDriver -Name $DriverName -ErrorAction SilentlyContinue)) {
-        return [pscustomobject]@{ Success=$false; DriverName=$DriverName; Message=("Driver '$DriverName' is still not present after install. " + ($log -join ' ')) }
+        return (& $ret $false ("Driver '$DriverName' is still not present after install. " + ($log -join ' ')))
     }
-    [pscustomobject]@{ Success=$true; DriverName=$DriverName; Message=("Registered driver '$DriverName'. " + ($log -join ' ')).Trim() }
+    return (& $ret $true ("Registered driver '$DriverName'. " + ($log -join ' ')).Trim())
+}
+
+# Toolkit-added trusted publishers are recorded here, so only those can be removed.
+$script:DriverTrustDir = Join-Path $env:ProgramData 'PrinterToolkit\snapshots'
+
+function Get-PnputilExitText {
+    <#
+    .SYNOPSIS
+        Plain wording for a pnputil exit code.
+    .DESCRIPTION
+        pnputil returns SetupAPI's own codes (0xE0000xxx), which Windows' message
+        table does not hold - Win32Exception and certutil both answer "Unknown
+        error" - so the ones a printer driver actually meets are named here. Anything
+        else falls back to the system message, then to the hex value.
+    #>
+    [CmdletBinding()] param([int]$Code)
+    $u = [int64]$Code -band 0xFFFFFFFFL
+    # Hex literals with an L suffix: a plain 0xE0000242 is a NEGATIVE Int32 in PS 5.1.
+    $known = @{
+        0L          = 'success'
+        3010L       = 'success, a restart is needed'
+        5L          = 'access denied - pnputil needs elevation'
+        0xE0000242L = 'ERROR_AUTHENTICODE_TRUST_NOT_ESTABLISHED: the package is signed by its vendor, and that publisher is not trusted on this PC yet'
+        0xE0000243L = 'ERROR_AUTHENTICODE_PUBLISHER_NOT_TRUSTED: this PC has the package''s publisher marked as untrusted'
+        0xE000022FL = 'ERROR_NO_CATALOG_FOR_OEM_INF: the INF names no catalog, so the package is unsigned'
+        0xE000024BL = 'ERROR_FILE_HASH_NOT_IN_CATALOG: a file does not match the package''s catalog - it is damaged or was altered'
+        0xE0000247L = 'ERROR_DRIVER_STORE_ADD_FAILED: the driver store refused the package'
+        0xE0000249L = 'ERROR_DRIVER_INSTALL_BLOCKED: driver installation is blocked by policy on this PC'
+    }
+    if ($known.ContainsKey($u)) { return $known[$u] }
+    $sys = ''
+    try { $sys = ([ComponentModel.Win32Exception]::new($Code)).Message } catch {}
+    if ($sys -and $sys -notmatch '^Unknown error') { return $sys }
+    return ('0x{0:X8}, not a code this toolkit recognises' -f $u)
+}
+
+function Get-DriverPackageTrust {
+    <#
+    .SYNOPSIS
+        Who signed a driver package, and whether Windows will install it without asking.
+    .DESCRIPTION
+        Reads the catalog the INF names (CatalogFile.NTamd64 on 64-bit Windows, else
+        CatalogFile) and its Authenticode signature:
+          * signed by Microsoft's driver signing service (WHQL)  -> installs silently
+          * signed by the vendor, publisher already trusted      -> installs silently
+          * signed by the vendor, publisher NOT trusted          -> NeedsTrust: Windows
+            would ask "Always trust software from <vendor>?", which pnputil and a
+            SYSTEM session cannot show
+          * unsigned, tampered or untrusted chain                -> never offered trust
+        Read-only.
+    .OUTPUTS
+        PSCustomObject { InfPath; CatalogPath; Status; StatusMessage; SignerName; Signer; IssuerName;
+                         Thumbprint; NotAfter; IsWhql; PublisherTrusted; NeedsTrust; Message }
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$InfPath)
+    $r = [ordered]@{
+        InfPath = $InfPath; CatalogPath = ''; Status = 'Unknown'; StatusMessage = ''; SignerName = ''; Signer = ''; IssuerName = ''
+        Thumbprint = ''; NotAfter = $null; IsWhql = $false; PublisherTrusted = $false; NeedsTrust = $false; Message = ''
+    }
+    # Leaf: driver-store folders are themselves named like 'prnge001.inf_amd64_...'.
+    if (-not (Test-Path -LiteralPath $InfPath -PathType Leaf)) { $r.Status = 'InfMissing'; $r.Message = "INF file not found: $InfPath"; return [pscustomobject]$r }
+
+    # CatalogFile.NTamd64 wins on 64-bit Windows; the plain key otherwise.
+    $plain = ''; $arch = ''
+    $wantArch = if ([Environment]::Is64BitOperatingSystem) { 'ntamd64' } else { 'ntx86' }
+    try {
+        foreach ($ln in [IO.File]::ReadAllLines($InfPath)) {
+            $m = [regex]::Match($ln, '^\s*CatalogFile(\.[A-Za-z0-9]+)?\s*=\s*([^\s;]+)')
+            if (-not $m.Success) { continue }
+            $suffix = $m.Groups[1].Value.TrimStart('.').ToLowerInvariant()
+            $file = $m.Groups[2].Value.Trim('"')
+            if (-not $suffix -and -not $plain) { $plain = $file }
+            elseif ($suffix -eq $wantArch -and -not $arch) { $arch = $file }
+        }
+    } catch {}
+    $catName = if ($arch) { $arch } else { $plain }
+    if (-not $catName) {
+        $r.Status = 'NoCatalog'
+        $r.Message = 'The INF names no catalog file, so the package is unsigned. 64-bit Windows will not install an unsigned printer driver.'
+        return [pscustomobject]$r
+    }
+    $cat = Join-Path (Split-Path -Parent $InfPath) $catName
+    $r.CatalogPath = $cat
+    if (-not (Test-Path -LiteralPath $cat)) {
+        $r.Status = 'CatalogMissing'
+        $r.Message = "The INF names the catalog '$catName', but it is not beside the INF. Point the installer at the package's original extracted folder."
+        return [pscustomobject]$r
+    }
+
+    $sig = $null
+    try { $sig = Get-AuthenticodeSignature -LiteralPath $cat -ErrorAction Stop } catch {}
+    if (-not $sig) { $r.Status = 'UnknownError'; $r.Message = "The signature of '$catName' could not be read."; return [pscustomobject]$r }
+    $r.Status = [string]$sig.Status
+    $r.StatusMessage = [string]$sig.StatusMessage
+    $cert = $sig.SignerCertificate
+    if ($cert) {
+        $r.Signer = $cert.Subject
+        $r.SignerName = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+        $r.IssuerName = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $true)
+        $r.Thumbprint = $cert.Thumbprint
+        $r.NotAfter = $cert.NotAfter
+        # Windows Hardware Driver Verification (WHQL) and Windows System Component Verification.
+        foreach ($ext in @($cert.Extensions)) {
+            if ($ext.Oid.Value -ne '2.5.29.37') { continue }
+            foreach ($eku in @($ext.EnhancedKeyUsages)) {
+                if ($eku.Value -like '1.3.6.1.4.1.311.10.3.5*' -or $eku.Value -eq '1.3.6.1.4.1.311.10.3.6') { $r.IsWhql = $true }
+            }
+        }
+        $store = $null
+        try {
+            $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('TrustedPublisher', 'LocalMachine')
+            $store.Open('ReadOnly')
+            $r.PublisherTrusted = (@($store.Certificates | Where-Object { $_.Thumbprint -eq $cert.Thumbprint }).Count -gt 0)
+        } catch {} finally { if ($store) { $store.Close() } }
+    }
+
+    if ($r.Status -ne 'Valid') {
+        $r.Message = "The catalog '$catName' signature is $($r.Status): $($r.StatusMessage) Do not trust or install this package."
+    } elseif ($r.IsWhql) {
+        $r.Message = "Signed by Microsoft's driver signing service ($($r.SignerName)) - Windows installs it without asking."
+    } elseif ($r.PublisherTrusted) {
+        $r.Message = "Signed by $($r.SignerName), which is already a trusted publisher on this PC."
+    } else {
+        $r.NeedsTrust = $true
+        # A vendor certificate often expires before its drivers stop being used. The
+        # signature still verifies when the catalog was timestamped while it was valid.
+        $validity = if ($r.NotAfter -and $r.NotAfter -lt (Get-Date)) {
+            $(if ($sig.TimeStamperCertificate) { "expired $($r.NotAfter.ToString('d MMM yyyy')), but the catalog was timestamped while it was valid, so the signature still verifies" }
+              else { "expired $($r.NotAfter.ToString('d MMM yyyy'))" })
+        } else { "valid until $($r.NotAfter.ToString('d MMM yyyy'))" }
+        $r.Message = ("The package is signed by its vendor, $($r.SignerName) (certificate issued by $($r.IssuerName), $validity), not by Microsoft. " +
+            "Windows installs it without asking only once that publisher is trusted on this PC; " +
+            "at the desktop it asks 'Always trust software from $($r.SignerName)?', which pnputil and a SYSTEM session cannot show.")
+    }
+    return [pscustomobject]$r
+}
+
+function Add-DriverPublisherTrust {
+    <#
+    .SYNOPSIS
+        Trust the vendor that signed one driver package - that one certificate, nothing else.
+    .DESCRIPTION
+        Adds the catalog's signer certificate to LocalMachine\TrustedPublisher: what
+        ticking "Always trust software from <vendor>" does at the desktop. Refused
+        unless Get-DriverPackageTrust says NeedsTrust - a valid signature that is not
+        Microsoft's and not already trusted - so an unsigned, altered or WHQL package
+        never adds anything. Recorded so Remove-DriverPublisherTrust can undo it, and
+        confirmed by re-reading the store.
+    .OUTPUTS
+        PSCustomObject { Success; Thumbprint; SignerName; RecordPath; Message }
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][string]$InfPath)
+    $out = {
+        param([bool]$Ok, [string]$Msg, [string]$Thumb = '', [string]$Name = '', [string]$Rec = '')
+        [pscustomobject]@{ Success = $Ok; Thumbprint = $Thumb; SignerName = $Name; RecordPath = $Rec; Message = $Msg }
+    }
+    $t = Get-DriverPackageTrust -InfPath $InfPath
+    if ($t.Status -eq 'Valid' -and $t.PublisherTrusted) { return (& $out $true "$($t.SignerName) is already a trusted publisher on this PC." $t.Thumbprint $t.SignerName) }
+    if (-not $t.NeedsTrust) { return (& $out $false ("Not trusting anything: " + $t.Message) $t.Thumbprint $t.SignerName) }
+    if (-not (Test-PrintToolkitElevated)) { return (& $out $false 'Trusting a driver publisher needs elevation (Administrator or SYSTEM).' $t.Thumbprint $t.SignerName) }
+    if (-not $PSCmdlet.ShouldProcess($t.SignerName, 'Add to LocalMachine\TrustedPublisher')) { return (& $out $false 'Skipped (WhatIf).') }
+
+    # Take the certificate from the signature again rather than from anything passed in.
+    $cert = (Get-AuthenticodeSignature -LiteralPath $t.CatalogPath).SignerCertificate
+    if (-not $cert -or $cert.Thumbprint -ne $t.Thumbprint) { return (& $out $false 'The catalog changed while it was being checked - nothing was trusted.') }
+
+    $rec = ''
+    try {
+        if (-not (Test-Path -LiteralPath $script:DriverTrustDir)) { New-Item -ItemType Directory -Path $script:DriverTrustDir -Force | Out-Null }
+        $rec = Join-Path $script:DriverTrustDir ("trust-{0}.json" -f $cert.Thumbprint)
+        ([pscustomobject]@{
+            Computer = $env:COMPUTERNAME; Created = (Get-Date).ToString('o'); Thumbprint = $cert.Thumbprint
+            SignerName = $t.SignerName; Subject = $cert.Subject; NotAfter = $cert.NotAfter.ToString('o'); InfPath = $InfPath; Removed = $false
+        } | ConvertTo-Json) | Set-Content -LiteralPath $rec -Encoding UTF8
+    } catch {
+        return (& $out $false "The record needed to undo this could not be written ($($_.Exception.Message)), so nothing was trusted.")
+    }
+    $store = $null
+    try {
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('TrustedPublisher', 'LocalMachine')
+        $store.Open('ReadWrite')
+        $store.Add($cert)
+    } catch {
+        return (& $out $false "Could not add the certificate: $($_.Exception.Message)" $cert.Thumbprint $t.SignerName $rec)
+    } finally { if ($store) { $store.Close() } }
+
+    $after = Get-DriverPackageTrust -InfPath $InfPath
+    if ($after.PublisherTrusted) {
+        return (& $out $true "$($t.SignerName) is now a trusted driver publisher on this PC (certificate $($cert.Thumbprint))." $cert.Thumbprint $t.SignerName $rec)
+    }
+    return (& $out $false "The certificate was added but is not found when checked again." $cert.Thumbprint $t.SignerName $rec)
+}
+
+function Get-DriverPublisherTrust {
+    <# .SYNOPSIS The driver publishers THIS toolkit trusted on this PC, and whether each is still trusted. #>
+    [CmdletBinding()] param()
+    if (-not (Test-Path -LiteralPath $script:DriverTrustDir)) { return @() }
+    $inStore = @{}
+    $store = $null
+    try {
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('TrustedPublisher', 'LocalMachine')
+        $store.Open('ReadOnly')
+        foreach ($c in $store.Certificates) { $inStore[$c.Thumbprint] = $true }
+    } catch {} finally { if ($store) { $store.Close() } }
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($fi in @(Get-ChildItem -LiteralPath $script:DriverTrustDir -Filter 'trust-*.json' -File -ErrorAction SilentlyContinue)) {
+        $o = $null
+        try { $o = (Get-Content -LiteralPath $fi.FullName -Raw -ErrorAction Stop) | ConvertFrom-Json } catch { continue }
+        if (-not $o -or [string]$o.Computer -ne $env:COMPUTERNAME) { continue }
+        $list.Add([pscustomobject]@{
+            Thumbprint = [string]$o.Thumbprint; SignerName = [string]$o.SignerName; Created = [string]$o.Created
+            InfPath = [string]$o.InfPath; StillTrusted = [bool]$inStore[[string]$o.Thumbprint]; RecordPath = $fi.FullName
+        })
+    }
+    return $list.ToArray()
+}
+
+function Remove-DriverPublisherTrust {
+    <#
+    .SYNOPSIS
+        Undo Add-DriverPublisherTrust for one certificate.
+    .DESCRIPTION
+        Only a certificate this toolkit added on THIS computer (it has a record) is
+        removed. A publisher trusted by anyone else - Group Policy, an installer, a
+        technician at the desktop - is refused, because removing it would break
+        whatever relies on it.
+    .OUTPUTS
+        PSCustomObject { Success; Thumbprint; Message }
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][string]$Thumbprint)
+    $tp = ([string]$Thumbprint).Trim().ToUpperInvariant()
+    $out = { param([bool]$Ok, [string]$Msg) [pscustomobject]@{ Success = $Ok; Thumbprint = $tp; Message = $Msg } }
+    if ($tp -notmatch '^[0-9A-F]{40}$') { return (& $out $false "'$Thumbprint' is not a certificate thumbprint.") }
+    $rec = @(Get-DriverPublisherTrust | Where-Object { $_.Thumbprint -eq $tp })
+    if (-not $rec.Count) { return (& $out $false 'This certificate was not trusted by this toolkit on this PC, so it is left alone.') }
+    if (-not (Test-PrintToolkitElevated)) { return (& $out $false 'Removing a trusted publisher needs elevation (Administrator or SYSTEM).') }
+    if (-not $PSCmdlet.ShouldProcess($rec[0].SignerName, 'Remove from LocalMachine\TrustedPublisher')) { return (& $out $false 'Skipped (WhatIf).') }
+
+    $store = $null
+    try {
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('TrustedPublisher', 'LocalMachine')
+        $store.Open('ReadWrite')
+        foreach ($c in @($store.Certificates | Where-Object { $_.Thumbprint -eq $tp })) { $store.Remove($c) }
+    } catch {
+        return (& $out $false "Could not remove the certificate: $($_.Exception.Message)")
+    } finally { if ($store) { $store.Close() } }
+
+    $still = @(Get-DriverPublisherTrust | Where-Object { $_.Thumbprint -eq $tp -and $_.StillTrusted })
+    if ($still.Count) { return (& $out $false 'The certificate is still in Trusted Publishers when checked again.') }
+    try {
+        $o = (Get-Content -LiteralPath $rec[0].RecordPath -Raw) | ConvertFrom-Json
+        $o.Removed = $true
+        ($o | ConvertTo-Json) | Set-Content -LiteralPath $rec[0].RecordPath -Encoding UTF8
+    } catch {}
+    return (& $out $true "$($rec[0].SignerName) is no longer a trusted publisher on this PC. Drivers already installed from it stay installed.")
 }
 
 function Test-RepointResult {
@@ -4146,7 +4450,7 @@ function Test-UsbPrinterAttached {
     $offline = $null
     try {
         if ($Name) {
-            $esc = $Name -replace "'", "''"
+            $esc = ($Name -replace '\\', '\\') -replace "'", "\'"
             $w = Get-CimInstance Win32_Printer -Filter "Name='$esc'" -ErrorAction Stop
             if ($w) { $offline = [bool]$w.WorkOffline }
         }
@@ -4208,7 +4512,7 @@ function Get-PrinterShareAcl {
 
     $entries = [System.Collections.Generic.List[object]]::new()
     try {
-        $esc = $Name -replace "'", "''"
+        $esc = ($Name -replace '\\', '\\') -replace "'", "\'"
         $p = Get-CimInstance Win32_Printer -Filter "Name='$esc'" -ErrorAction Stop
         if (-not $p) { return [pscustomobject]@{ Ok=$false; Entries=@(); PrintTrustees=@(); Message="Printer '$Name' not found." } }
         $r = Invoke-CimMethod -InputObject $p -MethodName GetSecurityDescriptor -ErrorAction Stop
@@ -7620,7 +7924,11 @@ function Format-PrintDiagnosis {
             'NarrowRule'      { $lines.Add("  - On ${h}: Share Host -> Fix print RPC -> create the narrow rule for the pinned port, then test again from here.") }
             'EnableHostRules' { $lines.Add("  - On ${h}: Share Host -> Fix print RPC -> enable the built-in rules for the active profile, then test again from here.") }
             'Credentials'     { $lines.Add("  - Credentials... -> Save for $($d.UserName). Check the printer's Security tab on $h. In a workgroup, $($d.UserName) needs an account that exists on $h.") }
-            'InstallDriverLocalPort' { $lines.Add('  - Install the vendor driver here (Install driver...), then Add... with the local-port scope - and run the delivery test, because a created queue is not a printed page.') }
+            'InstallDriverLocalPort' {
+                $lines.Add("  - Find the exact driver $h uses (Host driver info...), and install that same driver here (Install driver... - a vendor-signed package such as Canon's asks to trust its publisher first).")
+                $lines.Add('  - Then Add... again with the SAME scope: with the driver already on this PC, nothing has to come from the host. Only if that still fails, use the local-port scope.')
+                $lines.Add('  - Run the delivery test afterwards: a connected or created queue is not a printed page.')
+            }
             'PatchHost'       { $lines.Add("  - Bring $h and this PC to the same patch level. Do not turn RpcAuthnLevelPrivacyEnabled off on either PC.") }
             'DeliveryTest'    { $lines.Add('  - Nothing is failing at the connection stage. If printing still does not work, add the printer and run the optional delivery test to see whether a job leaves the queue.') }
         }
@@ -7693,7 +8001,7 @@ function Invoke-PrinterDeliveryTest {
         $out = [ordered]@{ Sent = $false; JobId = $null; LeftQueue = $null; LastStatus = ''; Error = '' }
         try {
             $before = @(Get-PrintJob -PrinterName $Target -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
-            $esc = $Target -replace "'", "''"
+            $esc = ($Target -replace '\\', '\\') -replace "'", "\'"
             $p = Get-CimInstance Win32_Printer -Filter "Name='$esc'" -ErrorAction Stop
             $res = Invoke-CimMethod -InputObject $p -MethodName PrintTestPage -ErrorAction Stop
             if ([int]$res.ReturnValue -ne 0) {
@@ -9866,6 +10174,8 @@ $btnDelete.Add_Click({
                else         { Remove-PrinterSafe -Name $r.Name }
         Show-Result $res 'Deleted'
     } finally { Set-Busy $false }
+    # The grid still shows the old list until the scan finishes - say so.
+    Write-Log 'Rescanning to update the printer list (a few seconds)...' 'INFO'
     Start-Worker 'scan'
 })
 
@@ -9880,6 +10190,8 @@ $btnSetDef.Add_Click({
         $res = Set-DefaultPrinterForUser -PrinterName $r.Name -User $script:TargetUser -Sid $script:TargetSid -OnPoll $script:Pump
         Show-Result $res 'Default printer set'
     } finally { Set-Busy $false }
+    # The Default column still shows the old printer until the scan finishes - say so.
+    Write-Log 'Rescanning to show the new default (a few seconds)...' 'INFO'
     Start-Worker 'scan'
 })
 
@@ -10324,7 +10636,7 @@ function Show-RepointDialog {
         $f.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         $btnInf.Enabled = $false
         try {
-            $r = Install-PrinterDriverFromInf -InfPath $inf -DriverName $name.Trim()
+            $r = Invoke-DriverInstall -InfPath $inf -DriverName $name.Trim()
             [void](Show-Msg -Text $r.Message -Title $(if ($r.Success) { 'Driver installed' } else { 'Driver not installed' }) -Icon $(if ($r.Success) { 'Information' } else { 'Warning' }))
             if ($r.Success) {
                 & $loadDrivers
@@ -11029,11 +11341,13 @@ function Invoke-DiagnosisRemedy {
             }
         }
         'Driver' {
-            if ((Show-Msg -Text "The cause is the DRIVER ($($Diagnosis.Confidence)): $($Diagnosis.Why)`r`n`r`nInstall the vendor driver on this PC now? Then Add... again with the local-port scope, and run the delivery test - a created queue is not a printed page." -Title 'Install a driver?' -Buttons 'YesNo' -Icon 'Question') -eq 'Yes') {
+            # Same scope first: once the driver is on this PC, a per-computer or
+            # per-user connection needs nothing from the host. Local port is the
+            # fallback, not the default - it is a workaround, not a connection.
+            if ((Show-Msg -Text "The cause is the DRIVER ($($Diagnosis.Confidence)): $($Diagnosis.Why)`r`n`r`nInstall the same driver the host uses on this PC now? (Host driver info... shows its exact name.) Then press Add... again with the same scope; only if that still fails, switch to the local-port scope. Run the delivery test afterwards - a connected queue is not a printed page." -Title 'Install a driver?' -Buttons 'YesNo' -Icon 'Question') -eq 'Yes') {
                 $installed = Show-InstallDriverDialog
                 if ($installed) {
-                    $cboAddScope.SelectedIndex = 2
-                    Write-Log "Driver '$installed' installed. Scope switched to local port - select the queue and press Add... again." 'OK'
+                    Write-Log "Driver '$installed' installed. Press Add... again with the same scope; if it still fails, choose the local-port scope." 'OK'
                 }
             }
         }
@@ -11930,6 +12244,36 @@ function Show-JunkQueueDialog {
     return $script:JunkDialogDone
 }
 
+function Invoke-DriverInstall {
+    <#
+    .SYNOPSIS
+        Install-PrinterDriverFromInf, offering to trust a vendor-signed publisher first.
+    .DESCRIPTION
+        A package signed by its vendor rather than Microsoft installs only once that
+        publisher is trusted on the PC. Instead of failing, this shows who signed it
+        and asks - default No - before trusting that one certificate and installing.
+    #>
+    param([string]$InfPath, [string]$DriverName)
+    $r = Install-PrinterDriverFromInf -InfPath $InfPath -DriverName $DriverName
+    if (-not $r.Success -and $r.NeedsTrust -and $r.Trust) {
+        $t = $r.Trust
+        $q = "This driver package is signed by its vendor, not by Microsoft:`r`n`r`n" +
+             "   Publisher : $($t.SignerName)`r`n" +
+             "   Issued by : $($t.IssuerName)`r`n" +
+             "   Signature : verified`r`n`r`n" +
+             "$($t.Message)`r`n`r`n" +
+             "Trust $($t.SignerName) as a driver publisher on this PC and install '$DriverName'? " +
+             "Only this one certificate is added - the same as ticking 'Always trust' at the desktop - and Install driver -> Trusted publishers... removes it again."
+        if ((Show-Msg -Text $q -Title 'Trust this driver publisher?' -Buttons 'YesNo' -Icon 'Question' -Default 'No') -eq 'Yes') {
+            $r = Install-PrinterDriverFromInf -InfPath $InfPath -DriverName $DriverName -TrustPublisher
+        } else {
+            $r = [pscustomobject]@{ Success = $false; DriverName = $DriverName; NeedsTrust = $true; Trust = $t
+                Message = "Not installed: $($t.SignerName) was not trusted. $($t.Message)" }
+        }
+    }
+    return $r
+}
+
 function Show-InstallDriverDialog {
     <#
     .SYNOPSIS
@@ -11987,6 +12331,7 @@ function Show-InstallDriverDialog {
     $btnInstall = New-Btn 'Install selected' 10 40 140 27 $bot
     $btnManual  = New-Btn 'Pick an INF myself...' 156 40 160 27 $bot
     $btnCancel  = New-Btn 'Cancel' 322 40 90 27 $bot
+    $btnTrusted = New-Btn 'Trusted publishers...' 418 40 150 27 $bot
 
     $script:InfDlgResult = $null
     $script:InfCands = @()
@@ -12049,7 +12394,7 @@ function Show-InstallDriverDialog {
         $f.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         $btnInstall.Enabled = $false; $btnManual.Enabled = $false
         try {
-            $r = Install-PrinterDriverFromInf -InfPath $InfPath -DriverName $DriverName
+            $r = Invoke-DriverInstall -InfPath $InfPath -DriverName $DriverName
             Write-Log $r.Message $(if ($r.Success) { 'OK' } else { 'WARN' })
             [void](Show-Msg -Text $r.Message -Title $(if ($r.Success) { 'Driver installed' } else { 'Driver not installed' }) -Icon $(if ($r.Success) { 'Information' } else { 'Warning' }))
             if ($r.Success) { $script:InfDlgResult = $DriverName; $f.Close() }
@@ -12082,6 +12427,23 @@ function Show-InstallDriverDialog {
     })
 
     $btnCancel.Add_Click({ $f.Close() })
+
+    # Undo for the trust step: lists only the publishers this toolkit trusted.
+    $btnTrusted.Add_Click({
+        $trusted = @()
+        try { $trusted = @(Get-DriverPublisherTrust | Where-Object { $_.StillTrusted }) } catch {}
+        if (-not $trusted.Count) {
+            [void](Show-Msg -Text 'This console has not trusted any driver publisher on this PC.' -Title 'Trusted publishers' -Icon 'Information')
+            return
+        }
+        $pick = Show-PickList -Title 'Trusted publishers' -Prompt 'Driver publishers this console trusted on this PC. Pick one to stop trusting it:' -Items $trusted -Label { param($x) '{0}   (trusted {1})' -f $x.SignerName, ([string]$x.Created).Substring(0, [Math]::Min(10, ([string]$x.Created).Length)) }
+        if (-not $pick) { return }
+        $q = "Stop trusting $($pick.SignerName) as a driver publisher on this PC?`r`n`r`nDrivers already installed from it stay installed; installing another of its packages will need this trust again."
+        if ((Show-Msg -Text $q -Title 'Remove trusted publisher?' -Buttons 'YesNo' -Icon 'Warning' -Default 'No') -ne 'Yes') { return }
+        $rr = Remove-DriverPublisherTrust -Thumbprint $pick.Thumbprint
+        Write-Log $rr.Message $(if ($rr.Success) { 'OK' } else { 'WARN' })
+        [void](Show-Msg -Text $rr.Message -Title 'Trusted publishers' -Icon $(if ($rr.Success) { 'Information' } else { 'Warning' }))
+    })
 
     $f.Add_Shown({
         if ($SuggestName) { $lblHint.Text = "Looking for a driver that matches '$SuggestName'. The closest match is selected first." }

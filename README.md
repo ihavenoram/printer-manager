@@ -69,6 +69,7 @@ Each of these was measured, and each one breaks an approach that looks reasonabl
 - `Test-NetConnection` took 8.4 s where a raw socket took 17 ms, and reported a failed ping while port 9100 was open. Probes use raw sockets and never depend on ICMP.
 - `PrinterStatus`, `WorkOffline` and `DetectedErrorState` all reported healthy on a queue holding a seven-month-old stuck job. Health comes from an active probe plus job age.
 - `Add-PrinterConnection` and `Remove-PrinterConnection` don't exist, despite being widely cited. `Add-Printer -ConnectionName` and `Remove-Printer` do.
+- `pnputil` exit `-536870334` (`0xE0000242`) means the driver package is signed by its vendor and that publisher isn't trusted on this PC yet; the "Always trust software from…" question can't appear from `pnputil` or SYSTEM. **Install driver...** shows the publisher and certificate and asks before trusting that one certificate, refuses unsigned or altered packages, and confirms the driver reached the driver store before registering it. **Trusted publishers...** removes a publisher it added. (This trust-and-install path hasn't been run elevated on a live PC yet.)
 
 ## Notes
 
